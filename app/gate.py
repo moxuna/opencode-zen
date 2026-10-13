@@ -18,9 +18,11 @@ from typing import Any, Iterable
 
 NOTE_TEMPLATE = (
     "[zen-gateway] The model tried to call `{name}`, a stub tool this gateway injected to satisfy "
-    "the upstream free-tier check; your client has no such tool, so the call was suppressed. "
-    "Call one of your own tools instead{hint}."
+    "the upstream free-tier check; your client has no such tool, so the call was suppressed. {hint}"
 )
+
+ADVICE_WITH_TOOLS = "Call one of your own tools instead (%s)."
+ADVICE_NO_TOOLS = "Your client declared no tools at all, so reply in plain text instead."
 
 # The upstream gate wants tools literally named `read` and `bash`/`shell`. Clients name their
 # equivalents differently (Codex: exec_command, pi: bash, OpenCode: shell, ...), so instead of
@@ -166,7 +168,7 @@ def plan_gate(tools: list[Any], responses_api: bool = False, mode: str = "mirror
     hint = ""
     if stubs:
         available = ", ".join(sorted(n for n in names if n)[:4])
-        hint = " (%s)" % available if available else ""
+        hint = ADVICE_WITH_TOOLS % available if available else ADVICE_NO_TOOLS
     return GatePlan(injected=frozenset(set(aliases) | stubs), aliases=aliases, stubs=frozenset(stubs), hint=hint)
 
 
