@@ -26,7 +26,8 @@ command -v docker >/dev/null || curl -fsSL https://get.docker.com | sh
 # ② 建目录，先花 30 秒确认这台机器能用（3 项必须全 PASS）
 mkdir -p ~/opencode-zen && cd ~/opencode-zen
 curl -fsSLO https://raw.githubusercontent.com/moxuna/opencode-zen/main/scripts/probe_zen.py
-python3 probe_zen.py || (apt-get update && apt-get install -y python3 && python3 probe_zen.py)
+command -v python3 >/dev/null || (apt-get update && apt-get install -y python3)
+python3 probe_zen.py
 
 # ③ 下载 compose 与默认配置，然后启动（会自动拉取镜像）
 curl -fsSLO https://raw.githubusercontent.com/moxuna/opencode-zen/main/docker-compose.yml
