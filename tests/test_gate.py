@@ -17,6 +17,7 @@ from app.gate import (  # noqa: E402
     ResponsesRewriter,
     has_gate_tools,
     patch_body,
+    plan_gate,
 )
 from app.zen_session import decode_counter, mint_session  # noqa: E402
 
@@ -53,19 +54,53 @@ def test_session_ids() -> None:
 
 def test_patch_body() -> None:
     print("patch_body")
-    patched, injected = patch_body({"model": "m", "messages": []})
+    patched, plan = patch_body({"model": "m", "messages": []})
     names = {t["function"]["name"] for t in patched["tools"]}
     check("stream forced true", patched["stream"] is True)
-    check("injects read+bash", names == {"read", "bash"} and injected == frozenset({"read", "bash"}), str(names))
+    check("injects read+bash", names == {"read", "bash"} and plan.injected == frozenset({"read", "bash"}), str(names))
+    check("no client tool to mirror -> both are stubs", plan.stubs == frozenset({"read", "bash"}) and plan.aliases == {})
 
     mine = [{"type": "function", "function": {"name": "read", "description": "d", "parameters": {}}},
             {"type": "function", "function": {"name": "bash", "description": "d", "parameters": {}}}]
-    patched, injected = patch_body({"model": "m", "tools": mine})
-    check("client tools kept untouched", injected == frozenset() and patched["tools"] == mine)
+    patched, plan = patch_body({"model": "m", "tools": mine})
+    check("client tools kept untouched", plan.injected == frozenset() and patched["tools"] == mine)
 
-    patched, injected = patch_body({"model": "m", "tools": [{"type": "function", "function": {"name": "read"}}]})
-    check("only missing bash injected", injected == frozenset({"bash"}))
+    patched, plan = patch_body({"model": "m", "tools": [{"type": "function", "function": {"name": "read"}}]})
+    check("only missing bash injected", plan.injected == frozenset({"bash"}))
     check("has_gate_tools", has_gate_tools(patched["tools"]))
+
+    print("mirror mode: client tools are reused under the required names")
+    codex_tools = [
+        {"type": "function", "function": {"name": "exec_command", "description": "run", "parameters": {
+            "type": "object", "properties": {"cmd": {"type": "string"}}, "required": ["cmd"]}}},
+        {"type": "function", "function": {"name": "write_stdin", "description": "d", "parameters": {"type": "object", "properties": {}}}},
+    ]
+    patched, plan = patch_body({"model": "m", "tools": codex_tools}, mode="mirror")
+    by_name = {t["function"]["name"]: t for t in patched["tools"]}
+    check("client tools untouched", "exec_command" in by_name and "write_stdin" in by_name)
+    check("bash is a mirror of exec_command", plan.aliases.get("bash") == "exec_command"
+          and by_name["bash"]["function"]["parameters"]["properties"] == {"cmd": {"type": "string"}}, str(plan.aliases))
+    check("read has no client equivalent -> stub", plan.stubs == frozenset({"read"}) and "read" in by_name)
+    check("gate satisfied", has_gate_tools(patched["tools"]))
+    check("stub mode disables mirroring", plan_gate(codex_tools, mode="stub").aliases == {})
+
+    responses_tools = [{"type": "function", "name": "exec_command", "description": "d",
+                        "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}}}]
+    patched, plan = patch_body({"model": "m", "tools": responses_tools}, responses_api=True, mode="mirror")
+    mirrored = [t for t in patched["tools"] if t.get("name") == "bash"]
+    check("responses shape mirrored too", bool(mirrored) and mirrored[0]["parameters"]["properties"] == {"cmd": {"type": "string"}})
+
+    print("mirror mode: outgoing calls are renamed back to the client tool")
+    plan = plan_gate(codex_tools, mode="mirror")
+    rewriter = ChatRewriter(plan, "text")
+    chunk = rewriter.feed(chat_chunk(name="bash", arguments='{"cmd":"ls"}'))
+    call = chunk["choices"][0]["delta"]["tool_calls"][0]
+    check("bash call renamed to exec_command", call["function"]["name"] == "exec_command", str(call))
+    final = rewriter.feed(chat_chunk(finish="tool_calls"))
+    check("real tool keeps finish_reason", final["choices"][0]["finish_reason"] == "tool_calls")
+    stub_chunk = rewriter.feed(chat_chunk(name="read", arguments='{"path":"/etc/hosts"}'))
+    check("pure stub still neutralised", "tool_calls" not in stub_chunk["choices"][0]["delta"]
+          and "[zen-gateway]" in stub_chunk["choices"][0]["delta"].get("content", ""))
 
 
 def test_chat_rewriter() -> None:

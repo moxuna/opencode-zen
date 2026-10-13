@@ -13,13 +13,40 @@ so the client never sees a tool it did not declare.
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from typing import Any, Iterable
 
 NOTE_TEMPLATE = (
-    "[zen-gateway] The model tried to call `{name}`, which is a stub tool the gateway "
-    "injected to satisfy the upstream free-tier check. Your client has no such tool, so "
-    "the call was suppressed."
+    "[zen-gateway] The model tried to call `{name}`, a stub tool this gateway injected to satisfy "
+    "the upstream free-tier check; your client has no such tool, so the call was suppressed. "
+    "Call one of your own tools instead{hint}."
 )
+
+# The upstream gate wants tools literally named `read` and `bash`/`shell`. Clients name their
+# equivalents differently (Codex: exec_command, pi: bash, OpenCode: shell, ...), so instead of
+# injecting a look-alike stub - which models happily call, breaking the client's tool loop - the
+# gateway mirrors the client's own tool under the required name and renames calls back on the way out.
+SHELL_TOOL_HINTS = ("bash", "shell", "sh", "exec", "exec_command", "run_command", "command",
+                    "terminal", "powershell", "cmd")
+READ_TOOL_HINTS = ("read", "read_file", "readfile", "view_file", "view", "cat", "file_read",
+                   "open_file", "read_text_file")
+
+REQUIRED_READ = "read"
+REQUIRED_SHELL = "bash"
+
+
+@dataclass(frozen=True)
+class GatePlan:
+    """What patch_body added to a request and how to translate the answers back."""
+
+    injected: frozenset[str] = frozenset()          # tool names added to the request
+    aliases: dict[str, str] = field(default_factory=dict)   # added name -> client tool name
+    stubs: frozenset[str] = frozenset()             # added generic stubs (calls get neutralised)
+    hint: str = ""                                  # text appended to the neutralisation note
+
+    @property
+    def changed(self) -> bool:
+        return bool(self.injected)
 
 STUB_READ: dict[str, Any] = {
     "type": "function",
@@ -89,8 +116,67 @@ def has_gate_tools(tools: Iterable[Any]) -> bool:
     return "read" in names and bool(names & {"bash", "shell"})
 
 
-def patch_body(body: dict[str, Any], inject: bool = True, responses_api: bool = False) -> tuple[dict[str, Any], frozenset[str]]:
-    """Return (patched body, names of injected stub tools).
+def find_client_tool(tools: list[Any], hints: tuple[str, ...], taken: set[str]) -> tuple[str, Any] | None:
+    """Best candidate among the client's own tools for the given role."""
+    candidates = [(tool_name(tool) or "", tool) for tool in tools]
+    for hint in hints:  # exact match wins, in hint priority order
+        for name, tool in candidates:
+            if name == hint and name not in taken:
+                return name, tool
+    for hint in hints:  # then substring match
+        for name, tool in candidates:
+            if hint in name.lower() and name not in taken:
+                return name, tool
+    return None
+
+
+def rename_tool(tool: Any, name: str, responses_api: bool) -> dict[str, Any]:
+    """Copy a client tool definition under a different name (same schema)."""
+    if responses_api or not isinstance(tool.get("function"), dict):
+        renamed = dict(tool)
+        renamed["name"] = name
+        return renamed
+    renamed = dict(tool)
+    renamed["function"] = {**tool["function"], "name": name}
+    return renamed
+
+
+def plan_gate(tools: list[Any], responses_api: bool = False, mode: str = "mirror") -> GatePlan:
+    """Decide what has to be added so the upstream free-tier gate is satisfied."""
+    names = tool_names(tools)
+    aliases: dict[str, str] = {}
+    stubs: set[str] = set()
+    mirrored: set[str] = set()
+
+    if REQUIRED_READ not in names:
+        found = find_client_tool(tools, READ_TOOL_HINTS, mirrored) if mode == "mirror" else None
+        if found:
+            aliases[REQUIRED_READ] = found[0]
+            mirrored.add(found[0])
+        else:
+            stubs.add(REQUIRED_READ)
+    if not names & {"bash", "shell"}:
+        found = find_client_tool(tools, SHELL_TOOL_HINTS, mirrored) if mode == "mirror" else None
+        if found:
+            aliases[REQUIRED_SHELL] = found[0]
+            mirrored.add(found[0])
+        else:
+            stubs.add(REQUIRED_SHELL)
+
+    hint = ""
+    if stubs:
+        available = ", ".join(sorted(n for n in names if n)[:4])
+        hint = " (%s)" % available if available else ""
+    return GatePlan(injected=frozenset(set(aliases) | stubs), aliases=aliases, stubs=frozenset(stubs), hint=hint)
+
+
+def patch_body(
+    body: dict[str, Any],
+    inject: bool = True,
+    responses_api: bool = False,
+    mode: str = "mirror",
+) -> tuple[dict[str, Any], GatePlan]:
+    """Return (patched body, gate plan).
 
     The upstream gate needs stream=true always, so a client asking for a
     non-streaming answer still gets a streamed upstream request that the caller
@@ -98,24 +184,34 @@ def patch_body(body: dict[str, Any], inject: bool = True, responses_api: bool = 
     """
     patched = dict(body)
     patched["stream"] = True
-    injected: set[str] = set()
     if not inject:
-        return patched, frozenset()
+        return patched, GatePlan()
 
     tools = body.get("tools")
     tools = list(tools) if isinstance(tools, list) else []
-    names = tool_names(tools)
-    read_stub = STUB_READ_RESPONSES if responses_api else STUB_READ
-    bash_stub = STUB_BASH_RESPONSES if responses_api else STUB_BASH
-    if "read" not in names:
-        tools.append(dict(read_stub))
-        injected.add("read")
-    if not names & {"bash", "shell"}:
-        tools.append(dict(bash_stub))
-        injected.add("bash")
+    plan = plan_gate(tools, responses_api=responses_api, mode=mode)
+
+    for required, client_name in plan.aliases.items():
+        source = next((tool for tool in tools if tool_name(tool) == client_name), None)
+        if source is not None:
+            tools.append(rename_tool(source, required, responses_api))
+    for stub_name in sorted(plan.stubs):
+        if responses_api:
+            tools.append(dict(STUB_READ_RESPONSES if stub_name == REQUIRED_READ else STUB_BASH_RESPONSES))
+        else:
+            tools.append(dict(STUB_READ if stub_name == REQUIRED_READ else STUB_BASH))
+
     if tools:
         patched["tools"] = tools
-    return patched, frozenset(injected)
+    return patched, plan
+
+
+def as_plan(plan: GatePlan | frozenset[str] | set[str]) -> GatePlan:
+    """Accept a plain set of injected names for backwards compatibility."""
+    if isinstance(plan, GatePlan):
+        return plan
+    names = frozenset(plan)
+    return GatePlan(injected=names, stubs=names)
 
 
 def _content_delta(delta: dict[str, Any], note: str) -> None:
@@ -133,8 +229,12 @@ class ChatRewriter:
     attributed to the right tool name.
     """
 
-    def __init__(self, injected: frozenset[str], mode: str, forward_usage: bool = True) -> None:
-        self.injected = injected
+    def __init__(self, plan: GatePlan | frozenset[str], mode: str, forward_usage: bool = True) -> None:
+        self.plan = as_plan(plan)
+        self.injected = self.plan.injected
+        self.aliases = self.plan.aliases
+        self.stubs = self.plan.stubs
+        self.note_hint = self.plan.hint
         self.mode = mode
         self.forward_usage = forward_usage
         self.names: dict[int, str] = {}
@@ -163,11 +263,18 @@ class ChatRewriter:
                     if isinstance(name, str) and name:
                         self.names[index] = name
                     current = self.names.get(index)
-                    if current in self.injected:
+                    if current in self.aliases:
+                        # mirrored client tool: hand the call back under the client's own name
+                        if isinstance(call.get("function"), dict):
+                            call["function"]["name"] = self.aliases[current]
+                        self.real_calls.add(index)
+                        kept.append(call)
+                        continue
+                    if current in self.stubs:
                         if index not in self.announced:
                             self.announced.add(index)
                             if self.mode == "text":
-                                notes.append(NOTE_TEMPLATE.format(name=current))
+                                notes.append(NOTE_TEMPLATE.format(name=current, hint=self.note_hint))
                         continue
                     self.real_calls.add(index)
                     kept.append(call)
@@ -257,14 +364,17 @@ class ChatAggregator:
 class ResponsesRewriter:
     """Rewrite streamed Responses API events, hiding calls to injected stub tools."""
 
-    def __init__(self, injected: frozenset[str], mode: str) -> None:
-        self.injected = injected
+    def __init__(self, plan: GatePlan | frozenset[str], mode: str) -> None:
+        self.plan = as_plan(plan)
+        self.injected = self.plan.injected
+        self.aliases = self.plan.aliases
+        self.stubs = self.plan.stubs
         self.mode = mode
         self.stub_items: set[str] = set()
         self.notes: list[str] = []
 
     def _note(self, item: dict[str, Any]) -> str:
-        note = NOTE_TEMPLATE.format(name=item.get("name") or "stub")
+        note = NOTE_TEMPLATE.format(name=item.get("name") or "stub", hint=self.plan.hint)
         self.notes.append(note)
         return note
 
@@ -275,7 +385,11 @@ class ResponsesRewriter:
         item = event.get("item") if isinstance(event.get("item"), dict) else None
 
         if etype == "response.output_item.added" and item and item.get("type") == "function_call":
-            if item.get("name") in self.injected:
+            if item.get("name") in self.aliases:
+                renamed = dict(event)
+                renamed["item"] = {**item, "name": self.aliases[item["name"]]}
+                return [renamed]
+            if item.get("name") in self.stubs:
                 item_id = item.get("id") or item.get("call_id")
                 if item_id:
                     self.stub_items.add(item_id)
@@ -294,10 +408,17 @@ class ResponsesRewriter:
         if etype in ("response.function_call_arguments.delta", "response.function_call_arguments.done"):
             if event.get("item_id") in self.stub_items:
                 return []
+            if etype == "response.function_call_arguments.done" and event.get("name") in self.aliases:
+                return [{**event, "name": self.aliases[event["name"]]}]
 
         if etype == "response.output_item.done" and item:
-            if item.get("type") == "function_call" and (item.get("name") in self.injected or item.get("id") in self.stub_items):
-                return []
+            if item.get("type") == "function_call":
+                if item.get("name") in self.aliases:
+                    renamed = dict(event)
+                    renamed["item"] = {**item, "name": self.aliases[item["name"]]}
+                    return [renamed]
+                if item.get("name") in self.stubs or item.get("id") in self.stub_items:
+                    return []
 
         if etype == "response.completed":
             response = event.get("response")
@@ -308,17 +429,26 @@ class ResponsesRewriter:
     def _filter_output(self, output: list[Any]) -> list[Any]:
         kept: list[Any] = []
         for item in output:
-            if isinstance(item, dict) and item.get("type") == "function_call" and item.get("name") in self.injected:
-                if self.mode == "text":
-                    kept.append({
-                        "id": (item.get("id") or "msg") + ":stub-note",
-                        "type": "message",
-                        "status": "completed",
-                        "role": "assistant",
-                        "content": [{"type": "output_text", "text": NOTE_TEMPLATE.format(name=item.get("name")), "annotations": []}],
-                    })
+            if not isinstance(item, dict) or item.get("type") != "function_call":
+                kept.append(item)  # messages, reasoning, ... pass through untouched
                 continue
-            kept.append(item)
+            name = item.get("name")
+            if name in self.aliases:
+                kept.append({**item, "name": self.aliases[name]})  # mirrored client tool
+                continue
+            if name not in self.stubs:
+                kept.append(item)  # the client's own tool call
+                continue
+            if self.mode == "text":
+                kept.append({
+                    "id": (item.get("id") or "msg") + ":stub-note",
+                    "type": "message",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [{"type": "output_text",
+                                 "text": NOTE_TEMPLATE.format(name=name, hint=self.plan.hint),
+                                 "annotations": []}],
+                })
         return kept
 
 

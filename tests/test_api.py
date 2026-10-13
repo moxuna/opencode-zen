@@ -80,6 +80,21 @@ def handler(request: httpx.Request) -> httpx.Response:
         if "toolplease" in json.dumps(payload.get("messages")):
             chunk = chat_delta(tool={"index": 0, "id": "call_1", "type": "function", "function": {"name": "read", "arguments": '{"path":"/etc/hosts"}'}})
             return httpx.Response(200, content=sse(chunk, chat_delta(finish="tool_calls")), headers={"content-type": "text/event-stream"})
+        if "bridge-me" in json.dumps(payload.get("messages")):
+            chunks = [
+                chat_delta(role="assistant", content="bridged "),
+                chat_delta(content="answer"),
+                chat_delta(finish="stop"),
+                {"id": "chatcmpl-test", "choices": [], "usage": {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5}},
+            ]
+            return httpx.Response(200, content=sse(*chunks), headers={"content-type": "text/event-stream"})
+        if "bridge-tool" in json.dumps(payload.get("messages")):
+            chunks = [
+                chat_delta(tool={"index": 0, "id": "call_bridge", "type": "function",
+                                 "function": {"name": "exec_command", "arguments": '{"cmd":"ls"}'}}),
+                chat_delta(finish="tool_calls"),
+            ]
+            return httpx.Response(200, content=sse(*chunks), headers={"content-type": "text/event-stream"})
         chunks = [
             chat_delta(role="assistant", content="hello "),
             chat_delta(content="世界"),  # non-ASCII round trip
@@ -90,6 +105,11 @@ def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, content=sse(*chunks), headers={"content-type": "text/event-stream"})
 
     if path.endswith("/responses"):
+        payload = json.loads(request.content)
+        if "bridge-me" in json.dumps(payload):
+            # upstream says this model only speaks chat/completions
+            return httpx.Response(400, json={"type": "error", "error": {
+                "type": "ModelProtocolUnsupported", "message": "Model does not support this protocol."}})
         events = [
             {"type": "response.created", "response": {"id": "resp_1", "object": "response"}},
             {"type": "response.output_item.added", "output_index": 0, "item": {"id": "msg_1", "type": "message"}},
@@ -219,6 +239,51 @@ def run() -> int:
             handle.write("phone:sk-oczen-ffffffffffffffffffffffffffffffff\n")
         check("new key works without restart", client.get("/v1/models", headers={"Authorization": "Bearer sk-oczen-ffffffffffffffffffffffffffffffff"}).status_code == 200)
         check("old key still works", client.get("/v1/models", headers={"Authorization": "Bearer %s" % token}).status_code == 200)
+
+        print("responses: bridge to chat/completions for chat-only models")
+        SEEN_REQUESTS.clear()
+        response = client.post("/v1/responses", headers=headers, json={
+            "model": "mimo-v2.6-flash-free", "stream": False,
+            "input": [{"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "be terse"}]},
+                      {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "bridge-me"}]}],
+            "tools": [{"type": "function", "name": "exec_command", "description": "run", "parameters": {"type": "object", "properties": {}}}],
+            "reasoning": {"summary": "auto"}, "store": False, "include": ["reasoning.encrypted_content"],
+        })
+        check("bridged non-stream 200", response.status_code == 200, response.text[:200])
+        doc = response.json()
+        check("returns a response object", doc.get("object") == "response" and doc.get("status") == "completed", str(doc)[:120])
+        text = "".join(part.get("text", "") for item in doc["output"] if item["type"] == "message" for part in item["content"])
+        check("chat text converted to output_text", text == "bridged answer", repr(text))
+        check("usage mapped", doc["usage"]["total_tokens"] == 5 and doc["usage"]["input_tokens"] == 2, str(doc.get("usage")))
+        upstream = json.loads(SEEN_REQUESTS[-1].content)
+        check("upstream call is chat/completions", SEEN_REQUESTS[-1].url.path.endswith("/chat/completions"), SEEN_REQUESTS[-1].url.path)
+        check("developer message became system", upstream["messages"][0]["role"] == "system", str(upstream["messages"][0])[:80])
+        check("responses tool converted to chat tool", upstream["tools"][0]["function"]["name"] == "exec_command", str(upstream["tools"])[:80])
+        check("server-side fields not forwarded", not any(k in upstream for k in ("store", "include", "reasoning")))
+        check("stub tools injected on the chat path", {t["function"]["name"] for t in upstream["tools"]} == {"exec_command", "read", "bash"},
+              str([t["function"]["name"] for t in upstream["tools"]]))
+
+        print("responses: bridged streaming + tool calls")
+        with client.stream("POST", "/v1/responses", headers=headers, json={
+                "model": "mimo-v2.6-flash-free", "stream": True, "input": "bridge-tool"}) as stream:
+            raw = b"".join(stream.iter_bytes()).decode("utf-8")
+        check("bridged stream emits responses events", "event: response.created" in raw and "event: response.completed" in raw, raw[:80])
+        check("function_call delivered with call_id", "response.function_call_arguments.delta" in raw and "call_bridge" in raw, raw[-300:])
+        check("no chat-only fields leak to the client", '"object": "chat.completion' not in raw)
+
+        print("responses: native path for responses-capable models")
+        SEEN_REQUESTS.clear()
+        response = client.post("/v1/responses", headers=headers, json={"model": "muse-spark-1.3-contributor-free", "input": "hi"})
+        check("native responses 200", response.status_code == 200, response.text[:150])
+        check("upstream call is /responses", SEEN_REQUESTS[-1].url.path.endswith("/responses"), SEEN_REQUESTS[-1].url.path)
+
+        print("responses: auto fallback when the upstream rejects the protocol")
+        SEEN_REQUESTS.clear()
+        response = client.post("/v1/responses", headers=headers, json={"model": "muse-spark-1.3-contributor-free", "input": "bridge-me"})
+        check("fallback to chat bridge succeeds", response.status_code == 200, response.text[:200])
+        paths = [r.url.path for r in SEEN_REQUESTS]
+        check("tried native then bridge", paths == ["/zen/v1/responses", "/zen/v1/chat/completions"], str(paths))
+        check("fallback result is a response object", response.json().get("object") == "response", response.text[:120])
 
         print("access log")
         lines = [json.loads(line) for line in open(os.environ["ACCESS_LOG"], encoding="utf-8") if line.strip()]

@@ -63,6 +63,23 @@ class Settings:
     # drop   = silently remove calls to injected stubs
     # passthrough = forward the stub tool call as-is (client may not know the tool)
     stub_call_mode: str = field(default_factory=lambda: _str("STUB_CALL_MODE", "text").lower())
+    # mirror = satisfy the gate by exposing the client's own shell/read tool under the
+    #          required name and renaming calls back (keeps the client's tool loop working)
+    # stub   = inject a generic look-alike stub and neutralise calls to it
+    stub_tool_mode: str = field(default_factory=lambda: _str("STUB_TOOL_MODE", "mirror").lower())
+
+    # Responses API handling
+    #   auto   - models in RESPONSES_NATIVE_MODELS go through /responses, everything else is
+    #            bridged through /chat/completions (and auto-falls back when the upstream
+    #            answers ModelProtocolUnsupported)
+    #   native - always use /responses
+    #   bridge - always translate through /chat/completions
+    responses_mode: str = field(default_factory=lambda: _str("RESPONSES_MODE", "auto").lower())
+    responses_native_models: list[str] = field(
+        default_factory=lambda: _list("RESPONSES_NATIVE_MODELS")
+        or ["muse-spark-1.2-contributor-free", "muse-spark-1.3-contributor-free"]
+    )
+    bridge_reasoning: bool = field(default_factory=lambda: _bool("BRIDGE_REASONING", False))
 
     # access control
     key_file: str = field(default_factory=lambda: _str("KEY_FILE", "/data/api-keys.txt"))

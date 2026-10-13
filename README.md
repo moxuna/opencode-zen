@@ -84,7 +84,13 @@ docker compose down && rm -rf ~/opencode-zen     # 彻底删除
 网关自动把这些补齐，于是**任何客户端**都能用；同时它还是个正经的网关：
 
 - **密钥自管**：首启自动生成随机密钥，可加多把，改文件**立即生效**（不用重启）
-- **stub 工具不投毒**：客户端没带 `read`/`bash` 时网关注入最小 stub；模型真去调用它时，网关把调用转成一句文字提示并降级 `finish_reason`，**客户端永远看不到自己没声明过的工具**（也可配置成静默丢弃或原样透传）
+- **协议桥接**：客户端只会说 Responses（Codex CLI）而模型只支持 chat/completions（`mimo`、`big-pickle`……）
+  也没关系——网关自动双向翻译请求与流式响应；反过来上游若支持 Responses 就直连，`auto` 模式下遇到
+  `ModelProtocolUnsupported` 还会自动回退重试
+- **工具镜像**：上游硬性要求请求里有名为 `read` 和 `bash` 的工具。网关不会塞一个假工具捣乱，而是把
+  客户端自己的 shell/读文件工具（Codex 的 `exec_command`、pi 的 `bash`、OpenCode 的 `shell`）**改名镜像**成
+  要求的名字，模型调用后再把名字改回客户端原本的工具名，agent 工具调用链完全不受影响；客户端真没有对应工具时
+  才退回 stub，并把调用转成文字提示（`STUB_TOOL_MODE=mirror` 是默认值）
 - **非流式也能用**：上游只认 `stream:true`，客户端要非流式时网关收完 SSE 再聚合成标准 `chat.completion` / `response` 对象，`usage` 一并带上
 - **访问日志**：`data/access.jsonl`，含时间/密钥名/模型/tokens/耗时/状态/是否注入过 stub
 - **限速与白名单**：每把密钥每分钟上限、IP CIDR 白名单（默认关闭）
@@ -129,6 +135,7 @@ opencode-zen/
 | 第 ② 步就 FAIL | 这台 VPS 连不上上游（机房被 Cloudflare 拦 / 需要代理）。换机房，或在 `.env` 里加 `HTTPS_PROXY=http://...` 再启动 |
 | `401 invalid_api_key` | 密钥填错；`cat data/api-keys.txt` 核对。注意有些客户端会自动在 Base URL 后补 `/v1`，别重复填 |
 | `429` | 一是你在 `.env` 设的 `RATE_LIMIT_PER_MIN`，二是上游免费层限速（等一会儿或换模型） |
+| Codex 报 `ModelProtocolUnsupported` | 该模型只支持 chat/completions 而 Codex 只会说 Responses。v1.1.0+ 网关会自动桥接，升级即可；旧版本请先用 `muse-spark-1.3-contributor-free` |
 | `400 model_not_free` | 该模型需要真实的 `OPENCODE_API_KEY`（填进 `.env` 即可解锁全部 84 个模型） |
 | `413 body_too_large` / `502 aggregate_too_large` | 请求体或非流式聚合超了上限，调大 `MAX_BODY_BYTES` / `MAX_AGGREGATE_BYTES`，或改用 `stream:true` |
 | `502 upstream_unreachable` | 容器出不了网：检查 DNS、机房是否封 443、是否需要 `HTTPS_PROXY` |
@@ -150,6 +157,10 @@ opencode-zen/
 | `OPENCODE_API_KEY` | 空 | 留空=只用 11 个免费模型；填真实密钥=84 个模型全解锁 |
 | `INJECT_STUB_TOOLS` | `true` | 客户端没带 read/bash 时自动补（**关掉纯聊天客户端会 403**） |
 | `STUB_CALL_MODE` | `text` | 假工具被调用时：`text` 变文字提示 / `drop` 丢弃 / `passthrough` 原样透传 |
+| `STUB_TOOL_MODE` | `mirror` | `mirror` 镜像客户端自己的工具（推荐）/ `stub` 注入通用假工具 |
+| `RESPONSES_MODE` | `auto` | `auto` / `native` / `bridge`，见 `app/bridge.py` |
+| `RESPONSES_NATIVE_MODELS` | muse-spark 两个 | 哪些模型直接走 `/v1/responses` |
+| `BRIDGE_REASONING` | `false` | 桥接时是否把思考过程翻成 reasoning 事件 |
 | `IP_ALLOWLIST` | 空 | 例如 `1.2.3.4/32,10.0.0.0/8` |
 | `RATE_LIMIT_PER_MIN` | `0` | 每把密钥每分钟上限，0=不限 |
 | `TRUST_PROXY` | `false` | 在 Caddy/Nginx 后面才改 `true`（否则可被伪造来源 IP） |
@@ -221,6 +232,32 @@ phone:sk-oczen-yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy
 
 （`apiKey` 换成你自己的那串。）然后 `pi --model zengw/big-pickle`，或在 `/model` 里选。
 
+### Codex CLI
+
+Codex 只会说 Responses 协议（`wire_api = "responses"`），而大部分免费模型只会 chat/completions——
+网关会自动桥接，所以两者都能用。改 `~/.codex/config.toml`：
+
+```toml
+model = "mimo-v2.6-flash-free"        # 任何免费模型都行，chat-only 的也能用
+model_provider = "custom"
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+
+[model_providers.custom]
+name = "custom"
+wire_api = "responses"
+requires_openai_auth = false
+base_url = "http://你的VPS:8211/v1"
+experimental_bearer_token = "sk-oczen-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+```
+
+实测（v1.1.0）：`mimo-v2.6-flash-free` 与 `big-pickle` 走桥接、`muse-spark-1.3-contributor-free`
+走原生 Responses，三者的**工具调用（读文件→执行→回传结果）都能完整跑通**。
+
+> 如果只看到 `{"type":"error","error":{"type":"ModelProtocolUnsupported",...}}`，说明网关还是
+> v1.0.0（没有桥接）：`docker compose pull && docker compose up -d` 升级即可，或者先把 `model`
+> 换成 `muse-spark-1.3-contributor-free`。
+
 ### Cherry Studio / LobeChat / 其它
 
 - 类型：`OpenAI`（OpenAI 兼容）
@@ -290,8 +327,9 @@ curl -N http://你的VPS:8211/v1/chat/completions \
 ## 测试、CI 与开发
 
 ```bash
-python3 tests/test_gate.py     # 33 项：会话 ID 形状、stub 注入/剥离、非流式聚合（纯离线）
-python3 tests/test_api.py      # 46 项：HTTP 全链路，上游用 mock，不联网
+python3 tests/test_gate.py     # 43 项：会话 ID 形状、stub 注入/剥离、工具镜像、非流式聚合（纯离线）
+python3 tests/test_api.py      # 63 项：HTTP 全链路，上游用 mock，不联网
+python3 tests/test_bridge.py   # 38 项：Responses <-> chat 协议翻译（纯离线）
 python3 scripts/probe_zen.py   # 3 项：机器到 opencode.ai 的连通性与免费层是否放行（联网）
 pip install ruff && ruff check .
 

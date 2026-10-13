@@ -202,6 +202,40 @@ D:\workspace\temp\opencode-zen\
   `ghcr.io/moxuna/opencode-zen:latest`，并真起容器验证"root 属主的挂载卷 → 入口脚本自动修属主并
   降权到 uid 10001 → 首启生成 600 权限密钥 → `/healthz` OK → 未鉴权 401"。匿名 `docker pull` 实测可用）
 
+### v1.1.0：Responses 协议桥接 + 工具镜像
+
+起因：用 Codex CLI（`wire_api = "responses"`）配 `mimo-v2.6-flash-free` 时上游回
+`{"type":"error","error":{"type":"ModelProtocolUnsupported","message":"Model does not support this protocol."}}`
+——Codex 只会说 Responses，而该模型只支持 chat/completions。
+
+新增 `app/bridge.py`：
+
+- 请求方向：`instructions` + `input`（Codex 用 `role: developer`）→ chat `messages`（developer 合并成一条
+  system）；非 `function` 的 Responses 工具（`namespace`、`web_search`）丢弃；`function_call` →
+  assistant `tool_calls`；`function_call_output` → `role: tool`；`reasoning.effort` → `reasoning_effort`；
+  `store`/`include`/`prompt_cache_key`/`client_metadata` 不转发
+- 响应方向：chat SSE 分片 → Responses 事件（`response.created` / `output_item.added` /
+  `output_text.delta` / `function_call_arguments.delta` / `response.completed`），usage 映射为
+  `input_tokens`/`output_tokens`
+- 路由：`RESPONSES_MODE=auto` 时按 `RESPONSES_NATIVE_MODELS` 判断，直连失败且错误是
+  `ModelProtocolUnsupported` 时自动回退到桥接
+
+同时修掉一个真实缺陷（由 Codex 实测暴露）：注入通用 `bash` stub 后，模型会去调这个假工具而不是客户端
+自己的 `exec_command`，导致 Codex 的工具调用链中断。现在改为**工具镜像**（`STUB_TOOL_MODE=mirror`）：
+把客户端自己的 shell/读文件工具定义改名成 `read`/`bash` 放进请求，模型调用后网关再把名字改回
+客户端原本的工具名。
+
+实测（本机跑 v1.1.0 + Codex CLI 0.162.1）：
+
+| 场景 | 结果 |
+|---|---|
+| `mimo-v2.6-flash-free`（chat-only，走桥接）纯文本 | ✅ |
+| `mimo-v2.6-flash-free` 工具调用（读文件→执行→回传→回答） | ✅ 1095 tokens 单轮完成 |
+| `big-pickle`（chat-only，走桥接） | ✅ |
+| `muse-spark-1.3-contributor-free`（原生 Responses）工具调用 | ✅ |
+| 离线回归 | ruff + gate 43 项 + api 63 项 + bridge 38 项 全绿 |
+| 真实上游冒烟（含限速/白名单/并发/断连） | 47 项全绿 |
+
 ### 审查与冒烟（v1.1）
 
 - 静态检查：`ruff check .`（E/F/W/B）全绿，配置见 `pyproject.toml`

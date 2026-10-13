@@ -20,6 +20,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from . import __version__
 from .access import AccessLog, RateLimiter
+from .bridge import ChatToResponsesConverter, responses_to_chat
 from .config import is_free_model, settings
 from .gate import (
     ChatAggregator,
@@ -339,12 +340,12 @@ async def chat_completions(request: Request, key: str = Depends(authenticate)) -
     stream_options = body.get("stream_options")
     wants_usage = bool(stream_options.get("include_usage")) if isinstance(stream_options, dict) else False
 
-    patched, injected = patch_body(body, inject=settings.inject_stub_tools, responses_api=False)
+    patched, plan = patch_body(body, inject=settings.inject_stub_tools, responses_api=False, mode=settings.stub_tool_mode)
     merged_options = dict(stream_options) if isinstance(stream_options, dict) else {}
     merged_options["include_usage"] = True  # lets the gateway log token usage
     patched["stream_options"] = merged_options
 
-    meta = meta_from(request, key, model, want_stream, "/v1/chat/completions", injected)
+    meta = meta_from(request, key, model, want_stream, "/v1/chat/completions", plan.injected)
     response, error_response = await upstream_post("/chat/completions", key, patched)
     if error_response is not None:
         finish_meta(meta, None, error_response.status_code)
@@ -352,7 +353,7 @@ async def chat_completions(request: Request, key: str = Depends(authenticate)) -
 
     # a non-streaming client gets one aggregated object, so usage must be kept;
     # a streaming client only receives it when it asked for include_usage
-    rewriter = ChatRewriter(injected, settings.stub_call_mode, forward_usage=wants_usage or not want_stream)
+    rewriter = ChatRewriter(plan, settings.stub_call_mode, forward_usage=wants_usage or not want_stream)
     if want_stream:
         return StreamingResponse(
             chat_sse(response, rewriter, meta),
@@ -443,20 +444,23 @@ async def responses_json(response: httpx.Response, rewriter: ResponsesRewriter, 
     return JSONResponse(final)
 
 
-@app.post("/v1/responses")
-async def create_response(request: Request, key: str = Depends(authenticate)) -> Response:
-    body = await read_json(request)
-    model = guard_model(body)
-    want_stream = body.get("stream") is True
+async def responses_native(key: str, body: dict[str, Any], model: str, want_stream: bool, meta: dict[str, Any]) -> Response | None:
+    """Pass the request straight through to the upstream Responses API.
 
-    patched, injected = patch_body(body, inject=settings.inject_stub_tools, responses_api=True)
-    meta = meta_from(request, key, model, want_stream, "/v1/responses", injected)
+    Returns None when the upstream rejects the protocol and RESPONSES_MODE=auto, so the
+    caller can retry through the chat bridge instead.
+    """
+    patched, plan = patch_body(body, inject=settings.inject_stub_tools, responses_api=True, mode=settings.stub_tool_mode)
+    meta["injected_tools"] = sorted(plan.injected)
     response, error_response = await upstream_post("/responses", key, patched)
     if error_response is not None:
+        if settings.responses_mode == "auto" and b"ModelProtocolUnsupported" in (error_response.body or b""):
+            log.info("model %s does not support /responses upstream, retrying through the chat bridge", model)
+            return None
         finish_meta(meta, None, error_response.status_code)
         return error_response
 
-    rewriter = ResponsesRewriter(injected, settings.stub_call_mode)
+    rewriter = ResponsesRewriter(plan, settings.stub_call_mode)
     if want_stream:
         return StreamingResponse(
             responses_sse(response, rewriter, meta),
@@ -464,6 +468,145 @@ async def create_response(request: Request, key: str = Depends(authenticate)) ->
             headers={"cache-control": "no-cache", "x-accel-buffering": "no", "connection": "keep-alive"},
         )
     return await responses_json(response, rewriter, meta)
+
+
+def _sse_event(event: dict[str, Any]) -> str:
+    return "event: %s\ndata: %s\n\n" % (event.get("type", "message"), json.dumps(event, ensure_ascii=False))
+
+
+async def responses_bridge_sse(
+    response: httpx.Response,
+    rewriter: ChatRewriter,
+    converter: ChatToResponsesConverter,
+    meta: dict[str, Any],
+) -> AsyncIterator[str]:
+    status = 200
+    try:
+        for event in converter.start():
+            yield _sse_event(event)
+        async for line in response.aiter_lines():
+            if not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if payload in ("", "[DONE]"):
+                continue
+            try:
+                chunk = json.loads(payload)
+            except ValueError:
+                continue
+            if isinstance(chunk.get("error"), (dict, str)):
+                error = chunk["error"]
+                message = error.get("message") if isinstance(error, dict) else str(error)
+                status = 502
+                yield _sse_event({"type": "error", "sequence_number": converter.seq, "code": "upstream_error", "message": message})
+                continue
+            rewritten = rewriter.feed(chunk)
+            if rewritten is None:
+                continue
+            for event in converter.feed(rewritten):
+                yield _sse_event(event)
+        for event in converter.finish():
+            yield _sse_event(event)
+    except httpx.HTTPError as exc:
+        status = 502
+        yield _sse_event({"type": "error", "sequence_number": converter.seq, "code": "upstream_unreachable",
+                          "message": "Upstream stream failed: %s" % exc})
+    finally:
+        with suppress(Exception):
+            await response.aclose()
+        finish_meta(meta, converter.usage, status)
+
+
+async def responses_bridge_json(
+    response: httpx.Response,
+    rewriter: ChatRewriter,
+    converter: ChatToResponsesConverter,
+    meta: dict[str, Any],
+) -> JSONResponse:
+    consumed = 0
+    try:
+        async for line in response.aiter_lines():
+            consumed += len(line.encode("utf-8", "replace"))
+            if consumed > settings.max_aggregate_bytes:
+                raise ApiError(
+                    502,
+                    "Upstream response exceeded MAX_AGGREGATE_BYTES (%d). Use stream=true or raise the limit."
+                    % settings.max_aggregate_bytes,
+                    type_="api_error",
+                    code="aggregate_too_large",
+                )
+            if not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if payload in ("", "[DONE]"):
+                continue
+            try:
+                chunk = json.loads(payload)
+            except ValueError:
+                continue
+            if isinstance(chunk.get("error"), (dict, str)):
+                error = chunk["error"]
+                message = error.get("message") if isinstance(error, dict) else str(error)
+                finish_meta(meta, None, 502)
+                raise ApiError(502, "Upstream error: %s" % message, type_="api_error", code="upstream_error")
+            rewritten = rewriter.feed(chunk)
+            if rewritten is None:
+                continue
+            converter.feed(rewritten)
+    except httpx.HTTPError as exc:
+        finish_meta(meta, None, 502)
+        raise ApiError(502, "Upstream stream failed: %s" % exc, type_="api_error") from exc
+    except ApiError:
+        finish_meta(meta, None, 502)
+        raise
+    finally:
+        with suppress(Exception):
+            await response.aclose()
+    converter.finish()  # closes the open items so result() has the full output list
+    finish_meta(meta, converter.usage, 200)
+    return JSONResponse(converter.result())
+
+
+async def responses_bridge(key: str, body: dict[str, Any], model: str, want_stream: bool, meta: dict[str, Any]) -> Response:
+    """Translate a Responses request into chat/completions and the answer back."""
+    chat_body = responses_to_chat(body)
+    patched, plan = patch_body(chat_body, inject=settings.inject_stub_tools, responses_api=False, mode=settings.stub_tool_mode)
+    stream_options = {"include_usage": True}  # needed for the usage block of response.completed
+    patched["stream_options"] = stream_options
+    meta["injected_tools"] = sorted(plan.injected)
+
+    response, error_response = await upstream_post("/chat/completions", key, patched)
+    if error_response is not None:
+        finish_meta(meta, None, error_response.status_code)
+        return error_response
+
+    # forward_usage=True: the converter turns the usage chunk into response.completed.usage,
+    # so it must not be dropped even though the client never sees a chat chunk
+    rewriter = ChatRewriter(plan, settings.stub_call_mode, forward_usage=True)
+    converter = ChatToResponsesConverter(model, keep_reasoning=settings.bridge_reasoning)
+    if want_stream:
+        return StreamingResponse(
+            responses_bridge_sse(response, rewriter, converter, meta),
+            media_type="text/event-stream",
+            headers={"cache-control": "no-cache", "x-accel-buffering": "no", "connection": "keep-alive"},
+        )
+    return await responses_bridge_json(response, rewriter, converter, meta)
+
+
+@app.post("/v1/responses")
+async def create_response(request: Request, key: str = Depends(authenticate)) -> Response:
+    body = await read_json(request)
+    model = guard_model(body)
+    want_stream = body.get("stream") is True
+    meta = meta_from(request, key, model, want_stream, "/v1/responses", frozenset())
+
+    bridge_only = settings.responses_mode == "bridge"
+    native_first = settings.responses_mode == "native" or (settings.responses_mode == "auto" and model in settings.responses_native_models)
+    if not bridge_only and native_first:
+        native = await responses_native(key, body, model, want_stream, meta)
+        if native is not None:
+            return native
+    return await responses_bridge(key, body, model, want_stream, meta)
 
 
 # -------------------------------------------------------------------------- misc
