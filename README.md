@@ -293,9 +293,18 @@ curl -N http://你的VPS:8211/v1/chat/completions \
 python3 tests/test_gate.py     # 33 项：会话 ID 形状、stub 注入/剥离、非流式聚合（纯离线）
 python3 tests/test_api.py      # 46 项：HTTP 全链路，上游用 mock，不联网
 python3 scripts/probe_zen.py   # 3 项：机器到 opencode.ai 的连通性与免费层是否放行（联网）
-python3 scripts/smoke_live.py  # 38 项：真实上游端到端冒烟，占用 3 个端口（联网，约 30 秒）
 pip install ruff && ruff check .
+
+# 端到端冒烟：本地模式会自己起 3 个实例（含限速/白名单场景）
+python3 scripts/smoke_live.py
+
+# 端到端冒烟：远程模式，直接测已经部署好的网关（就是下面这条）
+python3 scripts/smoke_live.py --base-url http://你的VPS:8211 --key sk-oczen-...
 ```
+
+远程模式会跑 31 项：健康/就绪、`/v1/models` 与单模型查询、三种鉴权写法、非流式聚合（含
+`usage`）、中文往返、流式 SSE、客户端自带工具透传、注入 stub 被剥离、`/v1/responses`
+流式与非流式、400/404/413 错误码、4 路并发、客户端中途断连后仍健康。
 
 `main` 分支每次推送会触发 GitHub Actions：先跑 lint + 两套离线测试，再构建
 `linux/amd64` + `linux/arm64` 镜像推到 GHCR，最后真起一个容器验证
