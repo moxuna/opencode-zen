@@ -116,3 +116,22 @@ jobs:
           echo "unauthorized status: $(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8211/v1/models)"
           echo "--- container log ---"; docker logs zen-gateway
           docker rm -f zen-gateway
+
+      - name: Verify the documented quick start (repo compose file + .env.example)
+        run: |
+          set -euo pipefail
+          git clone --depth=1 --branch "${GITHUB_REF_NAME}" "https://github.com/${GITHUB_REPOSITORY}.git" /tmp/zen-quick-start
+          cd /tmp/zen-quick-start
+          cp .env.example .env
+          docker compose up -d
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8211/healthz >/dev/null 2>&1; then break; fi
+            sleep 2
+          done
+          echo "health: $(curl -fsS http://127.0.0.1:8211/healthz)"
+          echo "compose ps:"; docker compose ps
+          KEY=$(sudo grep -m1 -o 'sk-oczen-[0-9a-f]*' data/api-keys.txt)
+          echo "generated key: ${KEY:0:14}..."
+          echo "unauthorized: $(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8211/v1/models)"
+          echo "authorized:   $(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $KEY" http://127.0.0.1:8211/v1/models)"
+          docker compose down
