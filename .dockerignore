@@ -1,0 +1,13 @@
+# build context hygiene: only requirements.txt, app/ and scripts/ are COPYed,
+# so keeping the context small is all this needs to do
+data/
+.env
+.git/
+.gitignore
+*.md
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.ruff_cache/

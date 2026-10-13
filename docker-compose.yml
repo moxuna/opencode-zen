@@ -1,0 +1,29 @@
+services:
+  opencode-zen:
+    # 官方已构建好的镜像：`docker compose up -d` 会直接拉取，无需本地编译。
+    # 想用本仓库源码自己构建，就把下面两行互换（注释掉 image，启用 build）。
+    image: ghcr.io/moxuna/opencode-zen:latest
+    # build: .
+    container_name: opencode-zen
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # 容器内部固定监听 8211；要换对外端口就改 .env 里的 HOST_PORT
+      PORT: "8211"
+    ports:
+      - "${HOST_PORT:-8211}:8211"
+    volumes:
+      # 密钥与访问日志都落在这个目录，务必保留/备份
+      - ./data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8211/healthz',timeout=8)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

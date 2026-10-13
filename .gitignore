@@ -1,0 +1,10 @@
+data/*
+!data/.gitkeep
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# tooling caches
+.ruff_cache/

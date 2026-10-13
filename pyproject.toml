@@ -1,0 +1,13 @@
+[tool.ruff]
+line-length = 140
+target-version = "py313"
+exclude = ["data"]
+
+[tool.ruff.lint]
+# pragmatic set: real bugs + pycodestyle errors, no style bikeshedding
+select = ["E", "F", "W", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# test/smoke files are driven by long one-line assertions
+"tests/*" = ["E501"]
+"scripts/*" = ["E501"]
