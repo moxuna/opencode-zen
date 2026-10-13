@@ -198,7 +198,9 @@ D:\workspace\temp\opencode-zen\
 - 实测通过：非流式无 tools（靠 stub 过闸）、流式、`/v1/responses` 流式与非流式、
   自带 read+bash 的客户端原样透传 tool_calls、密钥热更新、付费模型拦截、
   stub 调用被转成文字且 `finish_reason` 由 `tool_calls` 降级为 `stop`、pi 客户端真实接入
-- 未测：Docker 构建（本机没装 Docker，需在 VPS 上 `docker compose up -d --build` 验证）
+- Docker 构建与运行：**已在 GitHub Actions 验证**（`linux/amd64` + `linux/arm64` 双架构推送到
+  `ghcr.io/moxuna/opencode-zen:latest`，并真起容器验证"root 属主的挂载卷 → 入口脚本自动修属主并
+  降权到 uid 10001 → 首启生成 600 权限密钥 → `/healthz` OK → 未鉴权 401"。匿名 `docker pull` 实测可用）
 
 ### 审查与冒烟（v1.1）
 
