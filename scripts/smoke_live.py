@@ -270,6 +270,33 @@ def check_responses(api: HttpTarget, key: str) -> None:
     record("responses stream emits events", status == 200 and "event: response." in text, text[:50].replace("\n", " "))
 
 
+def check_bridge(api: HttpTarget, key: str) -> None:
+    print("  -- protocol bridge (Responses client, chat-only model) --")
+    # Codex CLI speaks only Responses; mimo-v2.6-flash-free speaks only chat/completions. A tool
+    # named exec_command must be mirrored to satisfy the upstream gate, and any call must come
+    # back under the client's own name instead of the injected read/bash stubs.
+    exec_tool = {"type": "function", "name": "exec_command", "description": "Run a shell command",
+                 "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}, "required": ["cmd"]}}
+    bridged = {"model": "mimo-v2.6-flash-free", "input": "Reply with exactly: bridge-ok",
+               "tools": [exec_tool], "store": False, "include": ["reasoning.encrypted_content"]}
+    status, data, _ = api.request("POST", "/v1/responses", headers=bearer(key), body=bridged)
+    doc = api.json_or_none(data) or {}
+    text = "".join(part.get("text", "") for item in doc.get("output") or [] if item.get("type") == "message"
+                   for part in item.get("content") or [])
+    detail = doc.get("status") if status == 200 else data[:70].decode("utf-8", "replace")
+    record("chat-only model served over /v1/responses", status == 200 and doc.get("status") == "completed",
+           "HTTP %s %s" % (status, detail))
+    record("bridged answer carries text", bool(text.strip()), "text=%r" % text[:40])
+    leaked = [item.get("name") for item in doc.get("output") or []
+              if item.get("type") == "function_call" and item.get("name") in ("read", "bash")]
+    record("no stub tool call leaks back", not leaked, "leaked=%s" % leaked)
+    status, raw, _ = api.stream("/v1/responses", {**bridged, "stream": True}, bearer(key))
+    events = raw.decode("utf-8", "replace")
+    record("bridged stream emits Responses events",
+           status == 200 and "event: response.output_text.delta" in events and "response.completed" in events,
+           "HTTP %s bytes=%d" % (status, len(raw)))
+
+
 def check_errors(api: HttpTarget, key: str, big_body: bool = True) -> None:
     print("  -- error handling --")
     status, _, _ = api.request("POST", "/v1/chat/completions", headers=bearer(key), raw_body=b"{not json")
@@ -354,6 +381,7 @@ def run_shared_checks(api: HttpTarget, key: str, big_body: bool = True) -> None:
     check_chat(api, key)
     check_tools(api, key)
     check_responses(api, key)
+    check_bridge(api, key)
     check_errors(api, key, big_body=big_body)
     check_load(api, key)
 

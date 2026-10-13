@@ -340,9 +340,16 @@ python3 scripts/smoke_live.py
 python3 scripts/smoke_live.py --base-url http://你的VPS:8211 --key sk-oczen-...
 ```
 
-远程模式会跑 31 项：健康/就绪、`/v1/models` 与单模型查询、三种鉴权写法、非流式聚合（含
+远程模式会跑 35 项：健康/就绪、`/v1/models` 与单模型查询、三种鉴权写法、非流式聚合（含
 `usage`）、中文往返、流式 SSE、客户端自带工具透传、注入 stub 被剥离、`/v1/responses`
-流式与非流式、400/404/413 错误码、4 路并发、客户端中途断连后仍健康。
+流式与非流式、**协议桥接（chat-only 模型经 `/v1/responses` 回答，Codex 场景）**、
+400/404/413 错误码、4 路并发、客户端中途断连后仍健康。
+
+如果你是升级上来的，一条命令就能确认桥接生效：
+
+```bash
+python3 scripts/smoke_live.py --base-url http://你的VPS:8211 --key sk-oczen-...
+# 看到 "-- protocol bridge (Responses client, chat-only model) --" 下面 4 项 PASS 即可
 
 `main` 分支每次推送会触发 GitHub Actions：先跑 lint + 两套离线测试，再构建
 `linux/amd64` + `linux/arm64` 镜像推到 GHCR，最后真起一个容器验证

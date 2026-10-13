@@ -234,7 +234,7 @@ D:\workspace\temp\opencode-zen\
 | `big-pickle`（chat-only，走桥接） | ✅ |
 | `muse-spark-1.3-contributor-free`（原生 Responses）工具调用 | ✅ |
 | 离线回归 | ruff + gate 43 项 + api 63 项 + bridge 38 项 全绿 |
-| 真实上游冒烟（含限速/白名单/并发/断连） | 47 项全绿 |
+| 真实上游冒烟（含限速/白名单/并发/断连，v1.1.0 起含协议桥接一节） | 51 项全绿 |
 
 ### 审查与冒烟（v1.1）
 
